@@ -1,0 +1,459 @@
+"""Canonical OCR output contract — pure, dependency-free output-shape logic.
+
+This module implements the family-wide OCR output contract ratified in
+``docs/plans/00-output-contract/DECISION.md``. It is intentionally free of any
+engine-specific imports (no model SDKs, no PDF libraries) so it can be shared
+verbatim by every sibling OCR engine CLI: structure is guaranteed identical
+*by construction* because every engine emits through the same code.
+
+Everything here is about *where bytes go and what shape metadata takes* — never
+about *how OCR is performed*. The bytes -> page-text boundary stays engine-side:
+each engine produces a ``list[str]`` of per-page markdown (and figure bytes) and
+hands them to this library, which owns layout, page assembly, metadata, figure
+naming and the exit-code policy.
+
+Key guarantees:
+
+* Default output root is ``<input-parent>/ocr/`` (``-o`` overrides verbatim;
+  callers must never *require* ``-o``).
+* Per-document layout mirrors the input subtree, keyed on the input-RELATIVE
+  path (never the basename), fixing the family-wide basename-collision data-loss
+  class: ``<root>/<rel/dir>/<stem>/<stem>.md``.
+* All pages of a document live in one ``<stem>.md``, separated by ``## Page N``
+  headers. The markdown body is clean — no YAML frontmatter; provenance lives
+  only in the JSON sidecars.
+* Metadata at BOTH levels: a per-document ``<stem>/metadata.json`` and a
+  rolled-up root index ``metadata.json`` keyed by input-relative path. Failures
+  are recorded (``status="failed"``). The two stay in sync (the root index is
+  derived from / reconciled with the per-doc files).
+* Figures are named ``figures/figure_<N>_page<P>.png`` under the doc folder.
+* Exit policy is uniform across single-file and batch: nonzero if any
+  file/page failed.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from enum import StrEnum
+from pathlib import Path
+from typing import Any
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+#: One-word default output-root folder, sitting next to the input. Mirrors the
+#: existing ``Library/Papers/ocr/`` layout. NOT engine-specific.
+DEFAULT_OUTPUT_DIRNAME = "ocr"
+
+#: Schema version for the root index metadata document.
+METADATA_VERSION = "1"
+
+#: Filename for both the per-document sidecar and the rolled-up root index.
+METADATA_FILENAME = "metadata.json"
+
+#: Subfolder (under each doc folder) holding extracted figures.
+FIGURES_DIRNAME = "figures"
+
+#: Matches a ``## Page N`` boundary header anywhere in a markdown blob. Used to
+#: split a single-call OCR response back into per-page sections. Case-insensitive
+#: and tolerant of leading whitespace / trailing text on the marker line.
+PAGE_MARKER_RE = re.compile(r"^[ \t]*##[ \t]+Page[ \t]+(\d+)\b.*$", re.IGNORECASE | re.MULTILINE)
+
+#: Finish-reason tokens (normalized to upper-case, non-alphanumerics stripped)
+#: that indicate the model's output was cut off by a length/token limit. Used as
+#: one of two truncation signals for auto-fallback. Membership-checked, so a
+#: stray/unset finish_reason (e.g. a bare MagicMock) never matches.
+TRUNCATION_FINISH_REASONS = {"MAXTOKENS", "MAX_TOKENS", "LENGTH", "MODELLENGTH"}
+
+
+class Status(StrEnum):
+    """Per-document / per-file processing status recorded in metadata.
+
+    A ``StrEnum`` (Python 3.11+) so values serialize directly to JSON as plain
+    strings; ``.value`` is used explicitly at every serialization site.
+    """
+
+    COMPLETED = "completed"
+    FAILED = "failed"
+    PARTIAL = "partial"
+
+
+# ---------------------------------------------------------------------------
+# Primitives: checksum, timestamp
+# ---------------------------------------------------------------------------
+
+
+def sha256_checksum(path: Path) -> str:
+    """Return the ``sha256:<hexdigest>`` checksum of a file's bytes."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            h.update(chunk)
+    return f"sha256:{h.hexdigest()}"
+
+
+def utc_timestamp() -> str:
+    """Return the current time as a UTC ISO-8601 string (e.g. ``...+00:00``)."""
+    return datetime.now(UTC).isoformat()
+
+
+# ---------------------------------------------------------------------------
+# Path / key computation
+# ---------------------------------------------------------------------------
+
+
+def resolve_output_root(
+    input_path: Path,
+    output_dir: Path | None = None,
+) -> Path:
+    """Resolve the output root directory per the canon.
+
+    * If ``output_dir`` is given, it is used verbatim (``-o`` override).
+    * Otherwise the default is ``<input-parent>/ocr/`` for a single file, or
+      ``<input>/ocr/`` for a directory input — one word, next to the input.
+
+    The directory is NOT created here; that is the writer's job.
+    """
+    if output_dir is not None:
+        return Path(output_dir)
+    if input_path.is_dir():
+        return input_path / DEFAULT_OUTPUT_DIRNAME
+    return input_path.parent / DEFAULT_OUTPUT_DIRNAME
+
+
+def relative_key(file_path: Path, scan_root: Path) -> str:
+    """Compute the canonical input-RELATIVE key for a source file.
+
+    The key is the POSIX-style path of ``file_path`` relative to ``scan_root``.
+    This is the identity used everywhere (metadata keys, subtree mirroring),
+    NOT the basename — two ``intro.pdf`` files in different subdirectories get
+    distinct keys, fixing the basename-collision data-loss class.
+
+    ``scan_root`` is the directory that was scanned: the input directory for a
+    batch, or the file's parent for a single-file run. If ``file_path`` is not
+    under ``scan_root`` (which should not happen in normal use) the basename is
+    used as a safe fallback.
+    """
+    fp = Path(file_path)
+    root = Path(scan_root)
+    try:
+        rel = fp.resolve().relative_to(root.resolve())
+    except ValueError:
+        return fp.name
+    return rel.as_posix()
+
+
+def doc_dir_for(output_root: Path, rel_key: str) -> Path:
+    """Return the per-document folder for an input-relative key.
+
+    Layout: ``<root>/<rel/dir>/<stem>/`` — the input subtree is mirrored and a
+    final folder named after the file stem holds the aggregated output. The
+    relative directory portion (if any) is preserved so basenames never collide.
+    """
+    rel = Path(rel_key)
+    stem = rel.stem
+    return Path(output_root) / rel.parent / stem
+
+
+def markdown_path_for(doc_dir: Path, rel_key: str) -> Path:
+    """Return the aggregated markdown path ``<doc_dir>/<stem>.md``."""
+    stem = Path(rel_key).stem
+    return Path(doc_dir) / f"{stem}.md"
+
+
+def figures_dir_for(doc_dir: Path) -> Path:
+    """Return the figures subfolder for a document."""
+    return Path(doc_dir) / FIGURES_DIRNAME
+
+
+def figure_filename(figure_number: int, page_number: int) -> str:
+    """Return the canonical figure filename ``figure_<N>_page<P>.png``.
+
+    Figures are always normalised to PNG so links resolve and the family is
+    uniform regardless of the embedded image's native format.
+    """
+    return f"figure_{figure_number}_page{page_number}.png"
+
+
+def figure_markdown_link(figure_number: int, page_number: int) -> str:
+    """Return a relative markdown image link that resolves from the ``.md``.
+
+    The ``.md`` lives in the doc folder and figures live in ``figures/`` beside
+    it, so a ``figures/<name>`` relative link resolves correctly.
+    """
+    name = figure_filename(figure_number, page_number)
+    return f"![Figure {figure_number} (page {page_number})](./{FIGURES_DIRNAME}/{name})"
+
+
+# ---------------------------------------------------------------------------
+# Page assembly / splitting (engine-agnostic structural helpers)
+# ---------------------------------------------------------------------------
+
+
+def assemble_pages(pages: list[str]) -> str:
+    """Join per-page markdown into one document body with ``## Page N`` headers.
+
+    Pages are 1-indexed. Each page's text is placed under a ``## Page N`` header
+    and pages are separated by a blank line. The result is a clean markdown body
+    with NO YAML frontmatter — provenance lives in the JSON sidecar only.
+    """
+    sections: list[str] = []
+    for idx, text in enumerate(pages, start=1):
+        body = (text or "").strip()
+        sections.append(f"## Page {idx}\n\n{body}")
+    return "\n\n".join(sections) + ("\n" if sections else "")
+
+
+def split_native_pages(markdown: str) -> list[str]:
+    """Split a single-call markdown blob into per-page sections.
+
+    Splits on ``## Page N`` boundary headers (the marker line itself is dropped,
+    since :func:`assemble_pages` re-adds canonical headers). Any text appearing
+    before the first marker (preamble the model may emit) is prepended to the
+    first page so no content is lost.
+
+    Falls back to a single page (the whole blob) when no markers are present, so
+    the document is still emitted as valid contract output rather than discarded.
+    Returns an empty list only for empty/whitespace-only input.
+
+    Engine-agnostic: it operates only on the marker convention this contract
+    defines, so any engine that emits a whole-document blob can recover pages.
+    """
+    text = (markdown or "").strip()
+    if not text:
+        return []
+
+    matches = list(PAGE_MARKER_RE.finditer(markdown))
+    if not matches:
+        # Model ignored the marker instruction: keep everything as one page.
+        return [text]
+
+    pages: list[str] = []
+    preamble = markdown[: matches[0].start()].strip()
+    for i, m in enumerate(matches):
+        body_start = m.end()
+        body_end = matches[i + 1].start() if i + 1 < len(matches) else len(markdown)
+        body = markdown[body_start:body_end].strip()
+        if i == 0 and preamble:
+            body = (preamble + "\n\n" + body).strip() if body else preamble
+        pages.append(body)
+    return pages
+
+
+def _normalize_finish_reason(finish_reason: Any) -> str:
+    """Normalize a finish_reason (enum, str, or None) to an upper-case token."""
+    if finish_reason is None:
+        return ""
+    name = getattr(finish_reason, "name", None)
+    raw = name if isinstance(name, str) else str(finish_reason)
+    return re.sub(r"[^A-Za-z0-9]", "", raw).upper()
+
+
+def is_truncated(finish_reason: Any, parsed_pages: int, actual_pages: int) -> bool:
+    """Return True if a whole-document response looks truncated.
+
+    Two signals, no hardcoded page-count threshold:
+
+    * **finish reason** — the model reports it stopped on a length/token limit
+      (``MAX_TOKENS`` / ``LENGTH``); or
+    * **page shortfall** — fewer ``## Page N`` markers were recovered than the
+      document actually has pages (``parsed_pages < actual_pages``), meaning the
+      tail of the document was dropped.
+
+    ``actual_pages <= 0`` (page count unknown) disables the shortfall signal.
+
+    Engine-agnostic: ``finish_reason`` is duck-typed (any object exposing a
+    ``.name`` str, a plain string, or ``None``), so no model SDK is required.
+    """
+    if _normalize_finish_reason(finish_reason) in TRUNCATION_FINISH_REASONS:
+        return True
+    # Page shortfall: fewer recovered pages than the document actually has.
+    return actual_pages > 0 and parsed_pages < actual_pages
+
+
+# ---------------------------------------------------------------------------
+# Metadata records
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class DocMetadata:
+    """Provenance for one source document, written to both metadata levels.
+
+    Field set matches the ratified per-file schema:
+    ``{status, checksum, model, backend, processing_time, timestamp,
+    output_path, pages}``, plus engine-specific provenance fields that are only
+    serialized when set: ``mode`` (the processing path actually used) and
+    ``fell_back_from_whole_pdf`` (whether ``auto`` mode dropped from whole-PDF to
+    page-by-page because the whole-PDF output was truncated).
+    """
+
+    status: Status
+    checksum: str
+    model: str
+    backend: str
+    processing_time: float
+    timestamp: str
+    output_path: str
+    pages: int
+    error: str | None = None
+    #: Processing path actually used for this doc (engine-specific provenance).
+    mode: str | None = None
+    #: True when an auto run fell back from whole-PDF to per-page (non-silent).
+    fell_back_from_whole_pdf: bool = False
+
+    def to_entry(self) -> dict[str, Any]:
+        """Serialize to a JSON-ready dict (the per-file metadata entry)."""
+        entry: dict[str, Any] = {
+            "status": self.status.value,
+            "checksum": self.checksum,
+            "model": self.model,
+            "backend": self.backend,
+            "processing_time": round(self.processing_time, 2),
+            "timestamp": self.timestamp,
+            "output_path": self.output_path,
+            "pages": self.pages,
+        }
+        if self.mode is not None:
+            entry["mode"] = self.mode
+            # Only meaningful alongside a mode; surfaced whenever a mode is known.
+            entry["fell_back_from_whole_pdf"] = self.fell_back_from_whole_pdf
+        if self.error is not None:
+            entry["error"] = self.error
+        return entry
+
+
+def _atomic_write_json(path: Path, data: dict[str, Any]) -> None:
+    """Write ``data`` as pretty JSON atomically (tmp file + ``os.replace``)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path.write_text(
+        json.dumps(data, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    os.replace(str(tmp_path), str(path))
+
+
+def write_doc_metadata(doc_dir: Path, rel_key: str, meta: DocMetadata) -> Path:
+    """Write the per-document ``metadata.json`` sidecar beside its ``.md``.
+
+    The per-doc sidecar describes that one document and additionally records its
+    own input-relative ``key`` so it is self-describing for later reconciliation.
+    """
+    payload = {
+        "version": METADATA_VERSION,
+        "key": rel_key,
+        **meta.to_entry(),
+    }
+    path = Path(doc_dir) / METADATA_FILENAME
+    _atomic_write_json(path, payload)
+    return path
+
+
+class RootIndex:
+    """The rolled-up root ``metadata.json`` index, keyed by input-relative path.
+
+    Schema: ``{version, files: {<relpath>: <entry>}}``. Loads tolerantly (a
+    corrupt or missing file starts fresh) and writes atomically. The root index
+    is kept in sync with the per-doc sidecars: every per-doc write should be
+    mirrored here via :meth:`record`.
+    """
+
+    def __init__(self, output_root: Path) -> None:
+        self.output_root = Path(output_root)
+        self.path = self.output_root / METADATA_FILENAME
+        self._data: dict[str, Any] = {"version": METADATA_VERSION, "files": {}}
+        self._load()
+
+    def _load(self) -> None:
+        if self.path.exists():
+            try:
+                loaded = json.loads(self.path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict) and isinstance(loaded.get("files"), dict):
+                    self._data = loaded
+                    self._data.setdefault("version", METADATA_VERSION)
+            except (json.JSONDecodeError, OSError):
+                # Tolerant load: start fresh rather than crash on a bad index.
+                self._data = {"version": METADATA_VERSION, "files": {}}
+
+    @property
+    def files(self) -> dict[str, Any]:
+        return self._data.setdefault("files", {})
+
+    def get(self, rel_key: str) -> dict[str, Any] | None:
+        """Return the entry for an input-relative key, if present."""
+        return self.files.get(rel_key)
+
+    def is_completed(self, rel_key: str, checksum: str) -> bool:
+        """True if ``rel_key`` is recorded ``completed`` with a matching checksum."""
+        entry = self.files.get(rel_key)
+        if entry is None:
+            return False
+        if entry.get("status") != Status.COMPLETED.value:
+            return False
+        return entry.get("checksum") == checksum
+
+    def record(self, rel_key: str, meta: DocMetadata) -> None:
+        """Record (or overwrite) a per-file entry and persist atomically."""
+        self.files[rel_key] = meta.to_entry()
+        self.save()
+
+    def save(self) -> None:
+        """Persist the index atomically."""
+        _atomic_write_json(self.path, self._data)
+
+
+# ---------------------------------------------------------------------------
+# Exit-code policy
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class RunOutcome:
+    """Accumulates per-file/per-page outcomes to derive a uniform exit code.
+
+    The policy is uniform across single-file and batch: the exit code is nonzero
+    if ANY file or page failed (including partial documents). ``exit_code`` is 0
+    only when everything that was attempted completed cleanly.
+    """
+
+    completed: int = 0
+    failed: int = 0
+    partial: int = 0
+    failures: list[str] = field(default_factory=list)
+    #: Absolute paths of markdown files written this run (for scripting / quiet).
+    outputs: list[str] = field(default_factory=list)
+
+    def add(
+        self,
+        status: Status,
+        detail: str | None = None,
+        output_path: str | None = None,
+    ) -> None:
+        if output_path:
+            self.outputs.append(output_path)
+        if status is Status.COMPLETED:
+            self.completed += 1
+        elif status is Status.PARTIAL:
+            self.partial += 1
+            if detail:
+                self.failures.append(detail)
+        else:
+            self.failed += 1
+            if detail:
+                self.failures.append(detail)
+
+    @property
+    def has_failures(self) -> bool:
+        return self.failed > 0 or self.partial > 0
+
+    @property
+    def exit_code(self) -> int:
+        """0 if everything succeeded; 1 if any file/page failed or was partial."""
+        return 1 if self.has_failures else 0

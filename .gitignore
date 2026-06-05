@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+build/
+dist/
+
+# Virtual environments (never let an in-iCloud .venv become tracked)
+.venv
+.venv*
+
+# macOS
+.DS_Store
