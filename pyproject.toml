@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ocr-output-contract"
-version = "0.1.0"
+version = "0.1.1"
 description = "Canonical OCR output contract + conformance harness shared by the OCR engine CLI family"
 authors = [
     { name = "Ruben Fernandez-Fuertes", email = "fernandezfuertesruben@gmail.com" },

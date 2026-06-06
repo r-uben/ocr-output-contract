@@ -72,6 +72,10 @@ _FRONTMATTER_RE = re.compile(r"\A﻿?---\s*\n.*?\n---\s*\n", re.DOTALL)
 #: Canonical figure filename pattern: ``figure_<N>_page<P>.png``.
 _FIGURE_NAME_RE = re.compile(r"^figure_\d+_page\d+\.png$")
 
+#: A markdown inline image link ``![alt](target)``. Captures the raw target,
+#: which may carry an optional "title" (``(path "title")``) stripped before use.
+_IMAGE_LINK_RE = re.compile(r"!\[[^\]]*\]\(([^)]+)\)")
+
 #: ISO-8601 UTC timestamp (``...+00:00`` or ``...Z``). Loose but rejects naive.
 _UTC_TS_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}.*(\+00:00|Z)$")
 
@@ -118,8 +122,7 @@ def _check_entry(entry: dict[str, Any], label: str, expected_status: str | None)
         _require(key in entry, f"{label}: missing required key '{key}'")
         _require(
             isinstance(entry[key], typ),
-            f"{label}: key '{key}' has wrong type "
-            f"(got {type(entry[key]).__name__}, want {typ})",
+            f"{label}: key '{key}' has wrong type (got {type(entry[key]).__name__}, want {typ})",
         )
     _require(
         entry["status"] in _VALID_STATUSES,
@@ -157,6 +160,50 @@ def _check_markdown_body(md_path: Path, label: str, expected_pages: int) -> None
         _require(
             len(markers) == expected_pages,
             f"{label}: found {len(markers)} '## Page N' markers, expected {expected_pages}",
+        )
+
+
+def _is_external_link(target: str) -> bool:
+    """True for links the harness should not resolve on disk (URLs, data URIs)."""
+    lowered = target.lower()
+    return "://" in lowered or lowered.startswith(("http:", "https:", "data:", "mailto:", "#"))
+
+
+def _check_inline_image_links(md_path: Path, label: str) -> None:
+    """Assert every markdown ``![..](target)`` resolves to a file on disk.
+
+    Local image targets are resolved relative to the ``.md``'s own directory and
+    must exist; a dangling inline link (an engine that wrote a body referencing
+    an image it never saved, or saved under a different name) FAILS conformance.
+    This is the gap that let marker's dangling-inline-link bug through: the
+    harness previously checked figure *filenames* but never the *targets* the
+    markdown actually pointed at. External targets (http/https/data/anchors) are
+    not resolved.
+    """
+    text = md_path.read_text(encoding="utf-8")
+    base = md_path.parent
+    for raw in _IMAGE_LINK_RE.findall(text):
+        target = raw.strip()
+        # Strip an optional markdown title: ![](path "Title") or ![](path 'Title').
+        for quote in ('"', "'"):
+            qpos = target.find(f" {quote}")
+            if qpos != -1:
+                target = target[:qpos].strip()
+                break
+        # Strip surrounding angle brackets: ![](<path with spaces>).
+        if target.startswith("<") and target.endswith(">"):
+            target = target[1:-1].strip()
+        if not target or _is_external_link(target):
+            continue
+        # Drop any URL fragment/query on a local path.
+        target = target.split("#", 1)[0].split("?", 1)[0]
+        if not target:
+            continue
+        resolved = (base / target).resolve()
+        _require(
+            resolved.exists(),
+            f"{label}: dangling inline image link {raw.strip()!r} -> {resolved} "
+            f"does not exist (markdown references a figure that was never written)",
         )
 
 
@@ -260,6 +307,7 @@ def assert_conforms(
             continue
 
         _check_markdown_body(md_path, label, doc.pages)
+        _check_inline_image_links(md_path, label)
         _check_figures(doc_dir, doc.figures, label)
 
     # --- exit-policy relationship ----------------------------------------

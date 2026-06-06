@@ -17,9 +17,12 @@ from ocr_output_contract import (
     figure_markdown_link,
     figures_dir_for,
     is_truncated,
+    is_within_output_root,
+    iter_input_files,
     markdown_path_for,
     relative_key,
     resolve_output_root,
+    run_fingerprint,
     sha256_checksum,
     split_native_pages,
     utc_timestamp,
@@ -254,24 +257,55 @@ def test_write_doc_metadata_is_self_describing(tmp_path: Path) -> None:
 # --- root index ------------------------------------------------------------
 
 
-def test_root_index_records_and_reloads(tmp_path: Path) -> None:
-    meta = DocMetadata(
+def _completed_meta(output_path: str, **kw) -> DocMetadata:
+    base = dict(
         status=Status.COMPLETED,
         checksum="sha256:abc",
         model="m",
         backend="b",
         processing_time=1.0,
         timestamp=utc_timestamp(),
-        output_path="/x.md",
+        output_path=output_path,
         pages=1,
     )
+    base.update(kw)
+    return DocMetadata(**base)
+
+
+def test_root_index_records_and_reloads(tmp_path: Path) -> None:
+    # is_completed now requires the recorded output to still exist on disk.
+    md = tmp_path / "a" / "intro" / "intro.md"
+    md.parent.mkdir(parents=True)
+    md.write_text("## Page 1\n\nx\n", encoding="utf-8")
     idx = RootIndex(tmp_path)
-    idx.record("a/intro.pdf", meta)
+    idx.record("a/intro.pdf", _completed_meta("a/intro/intro.md"))
     # Re-open and confirm persisted + keyed by input-relative path.
     idx2 = RootIndex(tmp_path)
     assert idx2.get("a/intro.pdf") is not None
     assert idx2.is_completed("a/intro.pdf", "sha256:abc")
     assert not idx2.is_completed("a/intro.pdf", "sha256:different")
+
+
+def test_is_completed_requires_output_on_disk(tmp_path: Path) -> None:
+    md = tmp_path / "a" / "intro" / "intro.md"
+    md.parent.mkdir(parents=True)
+    md.write_text("x", encoding="utf-8")
+    idx = RootIndex(tmp_path)
+    idx.record("a/intro.pdf", _completed_meta("a/intro/intro.md"))
+    assert idx.is_completed("a/intro.pdf", "sha256:abc")
+    md.unlink()  # output deleted -> must reprocess
+    assert not RootIndex(tmp_path).is_completed("a/intro.pdf", "sha256:abc")
+
+
+def test_is_completed_invalidates_on_fingerprint_change(tmp_path: Path) -> None:
+    md = tmp_path / "doc" / "doc.md"
+    md.parent.mkdir(parents=True)
+    md.write_text("x", encoding="utf-8")
+    idx = RootIndex(tmp_path)
+    idx.record("doc.pdf", _completed_meta("doc/doc.md", fingerprint="fp-v1"))
+    assert idx.is_completed("doc.pdf", "sha256:abc", fingerprint="fp-v1")
+    # Different run config (model/task/prompt) -> reprocess.
+    assert not idx.is_completed("doc.pdf", "sha256:abc", fingerprint="fp-v2")
 
 
 def test_root_index_tolerates_corruption(tmp_path: Path) -> None:
@@ -305,3 +339,75 @@ def test_run_outcome_partial_is_nonzero() -> None:
     o = RunOutcome()
     o.add(Status.PARTIAL, detail="c/y.pdf")
     assert o.exit_code == 1
+
+
+# --- keying collision (same stem, different extension) ---------------------
+
+
+def test_doc_dir_disambiguates_same_stem_different_ext() -> None:
+    root = Path("/out")
+    pdf_dir = doc_dir_for(root, "a/foo.pdf")
+    png_dir = doc_dir_for(root, "a/foo.png")
+    assert pdf_dir != png_dir  # no on-disk collision
+    assert pdf_dir == root / "a" / "foo"  # PDF keeps the clean canon folder
+    assert png_dir == root / "a" / "foo_png"
+    assert markdown_path_for(pdf_dir, "a/foo.pdf") != markdown_path_for(png_dir, "a/foo.png")
+    # Metadata keys never collided (full relative path incl. extension):
+    assert relative_key(Path("/s/a/foo.pdf"), Path("/s")) != relative_key(
+        Path("/s/a/foo.png"), Path("/s")
+    )
+
+
+# --- output-root exclusion (resolved path, NOT by 'ocr' name) --------------
+
+
+def test_is_within_output_root_uses_resolved_paths(tmp_path: Path) -> None:
+    out = tmp_path / "ocr"
+    (out / "doc").mkdir(parents=True)
+    assert is_within_output_root(out, out)
+    assert is_within_output_root(out / "doc" / "doc.md", out)
+    assert not is_within_output_root(tmp_path / "input.pdf", out)
+
+
+def test_iter_input_files_excludes_output_root(tmp_path: Path) -> None:
+    (tmp_path / "a").mkdir()
+    (tmp_path / "a" / "paper.pdf").write_bytes(b"x")
+    out = tmp_path / "ocr"
+    (out / "paper").mkdir(parents=True)
+    (out / "paper" / "paper.md").write_text("## Page 1\n\nx", encoding="utf-8")
+    found = {p.name for p in iter_input_files(tmp_path, out, {".pdf"})}
+    assert found == {"paper.pdf"}  # the engine's own outputs are NOT re-ingested
+
+
+def test_iter_input_files_does_not_exclude_by_ocr_name(tmp_path: Path) -> None:
+    # A real input under a path component literally named 'ocr' (the user's own
+    # .../toolkits/ocr/... tree) MUST still be discovered (the old name-match bug
+    # would process ZERO files here).
+    scan = tmp_path / "toolkits" / "ocr" / "papers"
+    scan.mkdir(parents=True)
+    (scan / "real.pdf").write_bytes(b"x")
+    out = scan / "ocr"
+    out.mkdir()
+    found = {p.name for p in iter_input_files(scan, out, {".pdf"})}
+    assert found == {"real.pdf"}
+
+
+# --- run fingerprint -------------------------------------------------------
+
+
+def test_run_fingerprint_stable_and_config_sensitive() -> None:
+    a = run_fingerprint("gpt", "api")
+    assert a == run_fingerprint("gpt", "api") and a.startswith("fp:")
+    assert run_fingerprint("gpt", "api") != run_fingerprint("gpt2", "api")  # model
+    assert run_fingerprint("gpt", "api") != run_fingerprint("gpt", "ollama")  # backend
+    assert run_fingerprint("gpt", "api", task="t") != run_fingerprint("gpt", "api")  # task
+    assert run_fingerprint("gpt", "api", task=None) != run_fingerprint("gpt", "api", task="")
+
+
+# --- assemble_pages explicit numbering -------------------------------------
+
+
+def test_assemble_pages_explicit_page_numbers() -> None:
+    body = assemble_pages(["one", "two"], page_numbers=[3, 5])
+    assert "## Page 3" in body and "## Page 5" in body
+    assert "## Page 1" not in body

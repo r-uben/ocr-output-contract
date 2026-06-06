@@ -44,16 +44,19 @@ from ocr_output_contract.contract import (
     figure_markdown_link,
     figures_dir_for,
     is_truncated,
+    is_within_output_root,
+    iter_input_files,
     markdown_path_for,
     relative_key,
     resolve_output_root,
+    run_fingerprint,
     sha256_checksum,
     split_native_pages,
     utc_timestamp,
     write_doc_metadata,
 )
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 __all__ = [
     # version
@@ -78,6 +81,11 @@ __all__ = [
     "figures_dir_for",
     "figure_filename",
     "figure_markdown_link",
+    # input discovery (exclude the resolved output root)
+    "is_within_output_root",
+    "iter_input_files",
+    # run-config fingerprint
+    "run_fingerprint",
     # page assembly / splitting / truncation
     "assemble_pages",
     "split_native_pages",

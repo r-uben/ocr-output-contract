@@ -37,6 +37,7 @@ import hashlib
 import json
 import os
 import re
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -103,6 +104,36 @@ def utc_timestamp() -> str:
     return datetime.now(UTC).isoformat()
 
 
+def run_fingerprint(
+    model: str,
+    backend: str,
+    task: str | None = None,
+    prompt: str | None = None,
+) -> str:
+    """Return a stable ``fp:<hexdigest>`` fingerprint of the run configuration.
+
+    The fingerprint captures the parameters that change *what output a given
+    input produces*: the model, the backend, an optional task selector, and an
+    optional prompt. It is stored in :class:`DocMetadata` and consulted by
+    :meth:`RootIndex.is_completed` so that re-running an input under a different
+    model / task / prompt reprocesses it instead of silently reusing a cached
+    result keyed only on the input checksum.
+
+    Order- and whitespace-stable: fields are joined with a NUL separator and
+    ``None`` is encoded distinctly from the empty string, so ``task=None`` and
+    ``task=""`` do not collide. The long prompt is included verbatim (hashed),
+    so prompt drift invalidates the cache without bloating metadata.
+    """
+    parts = [
+        model or "",
+        backend or "",
+        "\x00" if task is None else task,
+        "\x00" if prompt is None else prompt,
+    ]
+    h = hashlib.sha256("\x00".join(parts).encode("utf-8")).hexdigest()
+    return f"fp:{h}"
+
+
 # ---------------------------------------------------------------------------
 # Path / key computation
 # ---------------------------------------------------------------------------
@@ -125,6 +156,115 @@ def resolve_output_root(
     if input_path.is_dir():
         return input_path / DEFAULT_OUTPUT_DIRNAME
     return input_path.parent / DEFAULT_OUTPUT_DIRNAME
+
+
+def is_within_output_root(path: Path, output_root: Path) -> bool:
+    """True if ``path`` is the resolved output root itself or nested under it.
+
+    This is the contract's required guard against *output self-ingestion*: when
+    the default output root sits inside the scanned tree (``<input>/ocr/``), a
+    naive recursive glob re-discovers the engine's own ``.md``/figure outputs as
+    fresh inputs on the next run, recursively polluting the tree.
+
+    Comparison is on the RESOLVED (absolute, symlink-collapsed) paths, so it
+    targets the *real* output directory — never a path component that merely
+    happens to be literally named ``ocr``. This is the fix for BOTH the
+    glm/deepseek output self-ingestion class AND the gemini/mistral/nougat
+    "exclude any component named 'ocr'" class (which would silently process ZERO
+    files under a user's own ``.../toolkits/ocr/...`` tree).
+
+    Engines MUST call this (directly, or via :func:`iter_input_files`) during
+    input discovery to skip anything under the resolved output root.
+    """
+    try:
+        resolved = Path(path).resolve()
+        root = Path(output_root).resolve()
+    except OSError:  # pragma: no cover - defensive (e.g. broken symlink loop)
+        return False
+    return resolved == root or root in resolved.parents
+
+
+def iter_input_files(
+    scan_root: Path,
+    output_root: Path,
+    suffixes: Iterable[str] | None = None,
+) -> Iterator[Path]:
+    """Walk ``scan_root`` recursively, yielding input files, excluding outputs.
+
+    This is the REQUIRED discovery primitive for every engine. It:
+
+    * recurses ``scan_root`` for files (so batch/nested inputs are found);
+    * excludes anything at or under the RESOLVED ``output_root`` (via
+      :func:`is_within_output_root`), pruning whole subtrees so the engine never
+      re-ingests its own ``.md``/figure outputs and never descends into them;
+    * optionally filters by suffix (case-insensitive, leading dot optional);
+    * yields in sorted order for deterministic, reproducible batches.
+
+    ``scan_root`` may be a single file (yielded if it matches and is not itself
+    inside ``output_root``) or a directory. Suffixes like ``{".pdf", "png"}``
+    are normalized to lower-case with a leading dot. Pass ``None`` to accept all
+    files.
+
+    Engines replace any hand-rolled ``rglob('*')`` / ``glob('**/*')`` discovery
+    with this call so the output-root exclusion is uniform across the family.
+    """
+    scan = Path(scan_root)
+    wanted = _normalize_suffixes(suffixes)
+
+    if scan.is_file():
+        if not is_within_output_root(scan, output_root) and _suffix_ok(scan, wanted):
+            yield scan
+        return
+
+    if not scan.is_dir():
+        return
+
+    root_resolved = Path(output_root).resolve()
+    matches: list[Path] = []
+    for dirpath, dirnames, filenames in os.walk(scan):
+        here = Path(dirpath)
+        # Prune the output-root subtree so we never descend into it.
+        dirnames[:] = [
+            d
+            for d in dirnames
+            if (here / d).resolve() != root_resolved and not _is_under(here / d, root_resolved)
+        ]
+        # If the current directory is itself the output root, skip its files too.
+        if is_within_output_root(here, output_root):
+            continue
+        for name in filenames:
+            fp = here / name
+            if _suffix_ok(fp, wanted):
+                matches.append(fp)
+    yield from sorted(matches)
+
+
+def _is_under(path: Path, resolved_root: Path) -> bool:
+    """Resolved-path containment helper for :func:`iter_input_files` pruning."""
+    try:
+        resolved = Path(path).resolve()
+    except OSError:  # pragma: no cover - defensive
+        return False
+    return resolved == resolved_root or resolved_root in resolved.parents
+
+
+def _normalize_suffixes(suffixes: Iterable[str] | None) -> set[str] | None:
+    """Normalize a suffix iterable to a lower-case, leading-dot set (or None)."""
+    if suffixes is None:
+        return None
+    out: set[str] = set()
+    for s in suffixes:
+        s = s.strip().lower()
+        if not s:
+            continue
+        out.add(s if s.startswith(".") else f".{s}")
+    return out
+
+
+def _suffix_ok(path: Path, wanted: set[str] | None) -> bool:
+    if wanted is None:
+        return True
+    return path.suffix.lower() in wanted
 
 
 def relative_key(file_path: Path, scan_root: Path) -> str:
@@ -154,11 +294,21 @@ def doc_dir_for(output_root: Path, rel_key: str) -> Path:
 
     Layout: ``<root>/<rel/dir>/<stem>/`` — the input subtree is mirrored and a
     final folder named after the file stem holds the aggregated output. The
-    relative directory portion (if any) is preserved so basenames never collide.
+    relative directory portion is preserved so basenames in different
+    subdirectories never collide.
+
+    Same-stem / different-extension inputs in the SAME directory (e.g.
+    ``a/foo.pdf`` and ``a/foo.png``) would otherwise collide on the ``<stem>``
+    folder. PDFs (the canonical primary input) keep the clean ``<stem>`` folder;
+    any other extension is disambiguated as ``<stem>_<ext>`` so the two never
+    overwrite each other on disk. Metadata keys never collide regardless: they
+    are the full input-relative path including extension (:func:`relative_key`).
     """
     rel = Path(rel_key)
     stem = rel.stem
-    return Path(output_root) / rel.parent / stem
+    suffix = rel.suffix.lower().lstrip(".")
+    folder = stem if suffix in ("", "pdf") else f"{stem}_{suffix}"
+    return Path(output_root) / rel.parent / folder
 
 
 def markdown_path_for(doc_dir: Path, rel_key: str) -> Path:
@@ -196,17 +346,29 @@ def figure_markdown_link(figure_number: int, page_number: int) -> str:
 # ---------------------------------------------------------------------------
 
 
-def assemble_pages(pages: list[str]) -> str:
+def assemble_pages(pages: list[str], page_numbers: list[int] | None = None) -> str:
     """Join per-page markdown into one document body with ``## Page N`` headers.
 
-    Pages are 1-indexed. Each page's text is placed under a ``## Page N`` header
-    and pages are separated by a blank line. The result is a clean markdown body
-    with NO YAML frontmatter — provenance lives in the JSON sidecar only.
+    By default pages are labeled by 1-based list position (``## Page 1``,
+    ``## Page 2``, ...). When ``page_numbers`` is given it supplies the EXPLICIT
+    label for each page, so an engine running a ``--pages 3,5`` subset can
+    preserve *source* page identity (``## Page 3``, ``## Page 5``) instead of
+    silently reindexing to 1..N. ``page_numbers`` must be the same length as
+    ``pages``.
+
+    Each page's text is placed under its ``## Page N`` header and pages are
+    separated by a blank line. The result is a clean markdown body with NO YAML
+    frontmatter — provenance lives in the JSON sidecar only.
     """
+    if page_numbers is not None and len(page_numbers) != len(pages):
+        raise ValueError(
+            f"page_numbers length ({len(page_numbers)}) must match pages length ({len(pages)})"
+        )
     sections: list[str] = []
-    for idx, text in enumerate(pages, start=1):
+    for idx, text in enumerate(pages):
+        number = page_numbers[idx] if page_numbers is not None else idx + 1
         body = (text or "").strip()
-        sections.append(f"## Page {idx}\n\n{body}")
+        sections.append(f"## Page {number}\n\n{body}")
     return "\n\n".join(sections) + ("\n" if sections else "")
 
 
@@ -303,6 +465,9 @@ class DocMetadata:
     output_path: str
     pages: int
     error: str | None = None
+    #: Run-config fingerprint (model/backend/task/prompt) from :func:`run_fingerprint`.
+    #: Lets :meth:`RootIndex.is_completed` invalidate when the run config changes.
+    fingerprint: str | None = None
     #: Processing path actually used for this doc (engine-specific provenance).
     mode: str | None = None
     #: True when an auto run fell back from whole-PDF to per-page (non-silent).
@@ -320,6 +485,8 @@ class DocMetadata:
             "output_path": self.output_path,
             "pages": self.pages,
         }
+        if self.fingerprint is not None:
+            entry["fingerprint"] = self.fingerprint
         if self.mode is not None:
             entry["mode"] = self.mode
             # Only meaningful alongside a mode; surfaced whenever a mode is known.
@@ -390,14 +557,52 @@ class RootIndex:
         """Return the entry for an input-relative key, if present."""
         return self.files.get(rel_key)
 
-    def is_completed(self, rel_key: str, checksum: str) -> bool:
-        """True if ``rel_key`` is recorded ``completed`` with a matching checksum."""
+    def is_completed(
+        self,
+        rel_key: str,
+        checksum: str,
+        *,
+        fingerprint: str | None = None,
+    ) -> bool:
+        """True if ``rel_key`` may be safely skipped as already-processed.
+
+        All of the following must hold for a skip (return True); otherwise the
+        document needs (re)processing and this returns False:
+
+        * an entry exists, recorded with ``status == "completed"``;
+        * the recorded input ``checksum`` matches (input unchanged);
+        * the recorded ``output_path`` still EXISTS on disk — a deleted output
+          is never treated as completed, so it gets re-emitted (fixes the
+          family-wide "index survives, .md deleted, doc silently skipped" bug);
+        * if ``fingerprint`` is given, it matches the recorded run-config
+          fingerprint — a re-run under a different model/task/prompt reprocesses
+          instead of silently reusing the prior output. When the caller passes a
+          fingerprint but the recorded entry has none (pre-0.1.1 index), the
+          entry is treated as stale and reprocessed.
+
+        ``output_path`` is resolved relative to the output root when stored as a
+        relative path, so the check works whether the engine recorded an
+        absolute or root-relative path.
+        """
         entry = self.files.get(rel_key)
         if entry is None:
             return False
         if entry.get("status") != Status.COMPLETED.value:
             return False
-        return entry.get("checksum") == checksum
+        if entry.get("checksum") != checksum:
+            return False
+        if fingerprint is not None and entry.get("fingerprint") != fingerprint:
+            return False
+        return self._output_exists(entry.get("output_path"))
+
+    def _output_exists(self, output_path: Any) -> bool:
+        """True if the recorded markdown output still exists on disk."""
+        if not output_path or not isinstance(output_path, str):
+            return False
+        p = Path(output_path)
+        if not p.is_absolute():
+            p = self.output_root / p
+        return p.exists()
 
     def record(self, rel_key: str, meta: DocMetadata) -> None:
         """Record (or overwrite) a per-file entry and persist atomically."""

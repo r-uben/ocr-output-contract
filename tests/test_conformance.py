@@ -232,3 +232,20 @@ def test_harness_catches_naive_timestamp(tmp_path: Path) -> None:
     (out_root / "metadata.json").write_text(json.dumps(index))
     with pytest.raises(ConformanceError, match="UTC ISO-8601"):
         assert_conforms(out_root, [ExpectedDoc(rel_key="doc.pdf", pages=1)])
+
+
+def test_harness_catches_dangling_inline_image_link(tmp_path: Path) -> None:
+    # The marker bug class: a body that references a figure that was never
+    # written. The harness must resolve every ![..](target) on disk and reject.
+    scan_root = tmp_path / "inbox"
+    scan_root.mkdir()
+    src = _src(scan_root, "report.pdf")
+    run_engine(scan_root, [FakeJob(src=src, pages=["p1"])])
+    out_root = resolve_output_root(scan_root)
+    md = out_root / "report" / "report.md"
+    md.write_text(
+        md.read_text() + "\n\n![Figure 1](./figures/figure_1_page1.png)\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ConformanceError, match="dangling inline image link"):
+        assert_conforms(out_root, [ExpectedDoc(rel_key="report.pdf", pages=1)])
