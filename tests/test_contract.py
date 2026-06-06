@@ -23,6 +23,7 @@ from ocr_output_contract import (
     relative_key,
     resolve_output_root,
     run_fingerprint,
+    safe_checksum,
     sha256_checksum,
     split_native_pages,
     utc_timestamp,
@@ -152,7 +153,11 @@ def test_is_truncated_on_finish_reason_string() -> None:
 
 
 def test_is_truncated_on_page_shortfall() -> None:
-    assert is_truncated(None, parsed_pages=3, actual_pages=10)
+    # v0.1.2: a bare count shortfall is NOT a truncation signal on its own (it
+    # can't tell a dropped tail from blank pages). A missing TAIL is, via
+    # recovered_page_numbers.
+    assert not is_truncated(None, parsed_pages=3, actual_pages=10)
+    assert is_truncated(None, 3, 10, recovered_page_numbers=[1, 2, 3])
 
 
 def test_not_truncated_when_complete() -> None:
@@ -411,3 +416,55 @@ def test_assemble_pages_explicit_page_numbers() -> None:
     body = assemble_pages(["one", "two"], page_numbers=[3, 5])
     assert "## Page 3" in body and "## Page 5" in body
     assert "## Page 1" not in body
+
+
+# --- v0.1.2: safe_checksum (no batch-abort on unreadable) ------------------
+
+
+def test_safe_checksum_ok_and_unreadable(tmp_path: Path) -> None:
+    f = tmp_path / "ok.pdf"
+    f.write_bytes(b"data")
+    assert safe_checksum(f) == sha256_checksum(f)
+    assert safe_checksum(tmp_path / "missing.pdf") is None  # unreadable -> None, never raises
+
+
+# --- v0.1.2: fingerprint with output-affecting flags -----------------------
+
+
+def test_run_fingerprint_extra_flags() -> None:
+    base = run_fingerprint("m", "b")
+    assert run_fingerprint("m", "b", extra={}) == base  # empty extra preserves old fp
+    fp1 = run_fingerprint("m", "b", extra={"raw": True, "dpi": 200})
+    assert fp1 != base
+    # key order irrelevant
+    assert run_fingerprint("m", "b", extra={"dpi": 200, "raw": True}) == fp1
+    # bool / int / str stay distinct; a changed flag invalidates
+    assert run_fingerprint("m", "b", extra={"raw": True}) != run_fingerprint(
+        "m", "b", extra={"raw": 1}
+    )
+    assert run_fingerprint("m", "b", extra={"dpi": 200}) != run_fingerprint(
+        "m", "b", extra={"dpi": 300}
+    )
+
+
+# --- v0.1.2: tail-aware truncation (no blank-page false-positive) -----------
+
+
+def test_is_truncated_finish_reason_unconditional() -> None:
+    assert is_truncated("MAX_TOKENS", 2, 3) is True
+    assert is_truncated("length", 3, 3) is True
+
+
+def test_is_truncated_count_alone_is_not_a_signal() -> None:
+    # Bare count shortfall (a blank page omitted) must NOT trigger a re-OCR.
+    assert is_truncated("STOP", 2, 3) is False
+
+
+def test_is_truncated_tail_missing_vs_internal_gap() -> None:
+    # Tail dropped (pages 1,2 of 3) -> truncated.
+    assert is_truncated("STOP", 2, 3, recovered_page_numbers=[1, 2]) is True
+    # Internal blank page (1,3 of 3; max==actual) -> NOT truncated.
+    assert is_truncated("STOP", 2, 3, recovered_page_numbers=[1, 3]) is False
+    # Out-of-range / duplicate markers don't mask truncation.
+    assert is_truncated("STOP", 2, 3, recovered_page_numbers=[1, 1, 999]) is True
+    assert is_truncated("STOP", 3, 3, recovered_page_numbers=[1, 2, 3]) is False

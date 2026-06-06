@@ -50,13 +50,14 @@ from ocr_output_contract.contract import (
     relative_key,
     resolve_output_root,
     run_fingerprint,
+    safe_checksum,
     sha256_checksum,
     split_native_pages,
     utc_timestamp,
     write_doc_metadata,
 )
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 
 __all__ = [
     # version
@@ -92,6 +93,7 @@ __all__ = [
     "is_truncated",
     # primitives
     "sha256_checksum",
+    "safe_checksum",
     "utc_timestamp",
     # metadata writers
     "write_doc_metadata",

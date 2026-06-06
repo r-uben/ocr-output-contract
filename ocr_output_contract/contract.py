@@ -99,6 +99,22 @@ def sha256_checksum(path: Path) -> str:
     return f"sha256:{h.hexdigest()}"
 
 
+def safe_checksum(path: Path) -> str | None:
+    """Like :func:`sha256_checksum`, but return ``None`` instead of raising.
+
+    Discovery can yield a file that is unreadable by the time it is processed
+    (permission denied, deleted/replaced mid-run, a broken symlink that passed
+    discovery). Engines should use this in the idempotency pre-check so an
+    unreadable input is recorded as a per-file FAILURE and the batch CONTINUES,
+    rather than an ``OSError`` propagating and aborting the whole run (the
+    SYS-02 "one bad file aborts the batch" failure mode).
+    """
+    try:
+        return sha256_checksum(path)
+    except OSError:
+        return None
+
+
 def utc_timestamp() -> str:
     """Return the current time as a UTC ISO-8601 string (e.g. ``...+00:00``)."""
     return datetime.now(UTC).isoformat()
@@ -109,20 +125,25 @@ def run_fingerprint(
     backend: str,
     task: str | None = None,
     prompt: str | None = None,
+    extra: dict[str, Any] | None = None,
 ) -> str:
     """Return a stable ``fp:<hexdigest>`` fingerprint of the run configuration.
 
     The fingerprint captures the parameters that change *what output a given
-    input produces*: the model, the backend, an optional task selector, and an
-    optional prompt. It is stored in :class:`DocMetadata` and consulted by
-    :meth:`RootIndex.is_completed` so that re-running an input under a different
-    model / task / prompt reprocesses it instead of silently reusing a cached
-    result keyed only on the input checksum.
+    input produces*: the model, the backend, an optional task selector, an
+    optional prompt, and any engine-specific output-affecting flags passed via
+    ``extra`` (e.g. ``{"raw": True, "dpi": 200, "analyze_figures": False,
+    "pdf_mode": "auto"}``). It is stored in :class:`DocMetadata` and consulted
+    by :meth:`RootIndex.is_completed` so that re-running an input under a
+    different model / task / prompt / flag reprocesses it instead of silently
+    reusing a cached result keyed only on the input checksum.
 
     Order- and whitespace-stable: fields are joined with a NUL separator and
     ``None`` is encoded distinctly from the empty string, so ``task=None`` and
-    ``task=""`` do not collide. The long prompt is included verbatim (hashed),
-    so prompt drift invalidates the cache without bloating metadata.
+    ``task=""`` do not collide. ``extra`` is serialized with sorted keys and
+    ``repr`` values, so key order is irrelevant and ``True``/``1``/``"1"`` stay
+    distinct. The long prompt is hashed verbatim, so prompt drift invalidates
+    the cache without bloating metadata.
     """
     parts = [
         model or "",
@@ -130,6 +151,10 @@ def run_fingerprint(
         "\x00" if task is None else task,
         "\x00" if prompt is None else prompt,
     ]
+    if extra:
+        # Canonical JSON: key order irrelevant; bool/int/str/None stay distinct;
+        # rejects NaN/Inf. Pass RESOLVED effective flags (incl. falsy values).
+        parts.append(json.dumps(extra, sort_keys=True, separators=(",", ":"), allow_nan=False))
     h = hashlib.sha256("\x00".join(parts).encode("utf-8")).hexdigest()
     return f"fp:{h}"
 
@@ -417,26 +442,42 @@ def _normalize_finish_reason(finish_reason: Any) -> str:
     return re.sub(r"[^A-Za-z0-9]", "", raw).upper()
 
 
-def is_truncated(finish_reason: Any, parsed_pages: int, actual_pages: int) -> bool:
-    """Return True if a whole-document response looks truncated.
+def is_truncated(
+    finish_reason: Any,
+    parsed_pages: int,
+    actual_pages: int,
+    recovered_page_numbers: list[int] | None = None,
+) -> bool:
+    """Return True if a whole-document response looks truncated (its tail dropped).
 
-    Two signals, no hardcoded page-count threshold:
+    Signals (no hardcoded page-count threshold):
 
     * **finish reason** — the model reports it stopped on a length/token limit
-      (``MAX_TOKENS`` / ``LENGTH``); or
-    * **page shortfall** — fewer ``## Page N`` markers were recovered than the
-      document actually has pages (``parsed_pages < actual_pages``), meaning the
-      tail of the document was dropped.
+      (``MAX_TOKENS`` / ``LENGTH``). Unconditional truncation signal.
+    * **missing tail** — when ``recovered_page_numbers`` is given (the numbers
+      parsed from the ``## Page N`` markers, where ``N`` MUST be the *physical*
+      PDF page number, not a ``1..k`` renumbering), truncation is inferred only
+      when the END of the document is missing: ``max(valid recovered) <
+      actual_pages``. Scattered internal gaps (legitimately BLANK pages a model
+      omits) do NOT trigger — this fixes the costly false-positive where a blank
+      cover/verso forced a needless full per-page re-OCR (~2x cost).
 
-    ``actual_pages <= 0`` (page count unknown) disables the shortfall signal.
+    A bare page-COUNT shortfall (``parsed_pages < actual_pages``) is deliberately
+    NOT a truncation signal on its own: it cannot distinguish a dropped tail from
+    blank pages. Pass ``recovered_page_numbers`` to enable the tail check.
 
-    Engine-agnostic: ``finish_reason`` is duck-typed (any object exposing a
-    ``.name`` str, a plain string, or ``None``), so no model SDK is required.
+    Caveat: genuinely blank *trailing* pages are indistinguishable from a dropped
+    tail by page numbers alone; gate on an explicit end-of-document sentinel
+    upstream if that matters. ``actual_pages <= 0`` disables the page-based
+    signal. ``finish_reason`` is duck-typed (``.name`` str / plain string /
+    ``None``), so no model SDK is required.
     """
     if _normalize_finish_reason(finish_reason) in TRUNCATION_FINISH_REASONS:
         return True
-    # Page shortfall: fewer recovered pages than the document actually has.
-    return actual_pages > 0 and parsed_pages < actual_pages
+    if recovered_page_numbers is None or actual_pages <= 0:
+        return False
+    valid = {n for n in recovered_page_numbers if 1 <= n <= actual_pages}
+    return max(valid, default=0) < actual_pages
 
 
 # ---------------------------------------------------------------------------
