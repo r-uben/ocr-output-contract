@@ -34,12 +34,14 @@ from ocr_output_contract.contract import (
     METADATA_VERSION,
     PAGE_MARKER_RE,
     TRUNCATION_FINISH_REASONS,
+    UNREADABLE_CHECKSUM,
     DocMetadata,
     RootIndex,
     RunOutcome,
     Status,
     assemble_pages,
     doc_dir_for,
+    failure_checksum,
     figure_filename,
     figure_markdown_link,
     figures_dir_for,
@@ -57,7 +59,7 @@ from ocr_output_contract.contract import (
     write_doc_metadata,
 )
 
-__version__ = "0.1.2"
+__version__ = "0.1.3"
 
 __all__ = [
     # version
@@ -94,6 +96,8 @@ __all__ = [
     # primitives
     "sha256_checksum",
     "safe_checksum",
+    "failure_checksum",
+    "UNREADABLE_CHECKSUM",
     "utc_timestamp",
     # metadata writers
     "write_doc_metadata",

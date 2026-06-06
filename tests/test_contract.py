@@ -7,12 +7,14 @@ from pathlib import Path
 
 from ocr_output_contract import (
     DEFAULT_OUTPUT_DIRNAME,
+    UNREADABLE_CHECKSUM,
     DocMetadata,
     RootIndex,
     RunOutcome,
     Status,
     assemble_pages,
     doc_dir_for,
+    failure_checksum,
     figure_filename,
     figure_markdown_link,
     figures_dir_for,
@@ -426,6 +428,19 @@ def test_safe_checksum_ok_and_unreadable(tmp_path: Path) -> None:
     f.write_bytes(b"data")
     assert safe_checksum(f) == sha256_checksum(f)
     assert safe_checksum(tmp_path / "missing.pdf") is None  # unreadable -> None, never raises
+
+
+def test_failure_checksum_returns_valid_sha256_sentinel(tmp_path: Path) -> None:
+    f = tmp_path / "ok.pdf"
+    f.write_bytes(b"data")
+    assert failure_checksum(f) == sha256_checksum(f)  # readable -> real digest
+    # unreadable -> a VALID sha256: sentinel (passes the conformance schema), not None
+    sentinel = failure_checksum(tmp_path / "missing.pdf")
+    assert sentinel == UNREADABLE_CHECKSUM
+    assert sentinel.startswith("sha256:") and len(sentinel) == len("sha256:") + 64
+    assert sentinel != failure_checksum(
+        f
+    )  # never equals a real digest -> reprocess on a later readable run
 
 
 # --- v0.1.2: fingerprint with output-affecting flags -----------------------

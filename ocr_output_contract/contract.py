@@ -61,6 +61,14 @@ METADATA_FILENAME = "metadata.json"
 #: Subfolder (under each doc folder) holding extracted figures.
 FIGURES_DIRNAME = "figures"
 
+#: Canonical ``sha256:``-prefixed sentinel recorded as the ``checksum`` of a
+#: document whose input bytes could NOT be read (permission denied, deleted
+#: mid-run, broken symlink). The schema requires a ``sha256:`` checksum even on
+#: a failure record, so engines must record this (via :func:`failure_checksum`)
+#: instead of ``None``/``""``. It can never equal a real digest, so a later
+#: readable run gets a different checksum and reprocesses.
+UNREADABLE_CHECKSUM = "sha256:" + "0" * 64
+
 #: Matches a ``## Page N`` boundary header anywhere in a markdown blob. Used to
 #: split a single-call OCR response back into per-page sections. Case-insensitive
 #: and tolerant of leading whitespace / trailing text on the marker line.
@@ -113,6 +121,18 @@ def safe_checksum(path: Path) -> str | None:
         return sha256_checksum(path)
     except OSError:
         return None
+
+
+def failure_checksum(path: Path) -> str:
+    """Return a valid ``sha256:`` checksum for a FAILURE record.
+
+    The real digest if the file is readable, else :data:`UNREADABLE_CHECKSUM`.
+    Engines must use this when recording a ``status=failed`` doc whose input may
+    be unreadable, so the failure entry still satisfies the metadata schema
+    (``checksum`` starting with ``sha256:``) rather than writing ``None``/``""``
+    and failing the conformance harness.
+    """
+    return safe_checksum(path) or UNREADABLE_CHECKSUM
 
 
 def utc_timestamp() -> str:
