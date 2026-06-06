@@ -126,7 +126,10 @@ def run_engine(
         )
         write_doc_metadata(doc_dir, rel_key, meta)
         index.record(rel_key, meta)
-        outcome.add(status, detail=rel_key if status is not Status.COMPLETED else None,
-                    output_path=str(md_path))
+        outcome.add(
+            status,
+            detail=rel_key if status is not Status.COMPLETED else None,
+            output_path=str(md_path),
+        )
 
     return outcome
